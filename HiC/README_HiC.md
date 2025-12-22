@@ -55,7 +55,7 @@ N_PERMUTATIONS = 1000
 
 - **Converted matrices:** `*.cool` and `*.h5` files
 - **Results CSV:** Enrichment scores, p-values, confidence intervals
-- **Volcano plot:** PNG showing significant regions
+- **Volcano plot:** PNG showing significant tissues
 
 ## Key Parameters
 
