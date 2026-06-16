@@ -178,13 +178,13 @@ function reanalyze() {
 # MAIN EXECUTION ROUTINE
 # ==============================================================================
 # Uncomment parameters as necessary depending on your checkpoint restarts
-# create_snps
-# genome_preparation
-# genome_index
-# cell_ranger
-# addTags
-# snpSplit
-# alleleToFastq 
+create_snps
+genome_preparation
+genome_index
+cell_ranger
+addTags
+snpSplit
+alleleToFastq 
 re_cellranger
 reanalyze
 
