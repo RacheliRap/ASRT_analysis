@@ -10,6 +10,18 @@ The pipeline operates as an integrated "round-trip" ecosystem across three scrip
 
 ---
 
+### Phase 0: Upstream Read Alignment & Sorting
+**Script:** `scripts/0_upstream_alignment.sh`
+
+Execute this script within an HPC SLURM queue environment. It resolves parental allocation mapping bias by creating N-masked synthetic genomes and isolating cell fragments by haplotypic origin.
+
+- **Variant Processing:** Re-engineers reference configurations by resolving shared variations between $129S1$ and $CAST$ strains.
+- **Genome Masking:** Calls `SNPsplit_genome_preparation` to flag known single-nucleotide variant zones as `N`-masked positions.
+- **Haplotype Demultiplexing:** Evaluates Picard alignments, drops hard-clipped anomalies, and parses read IDs using variant anchors back into distinct maternal (`genome1`) and paternal (`genome2`) FASTQ arrays via `seqtk`.
+- **Consensus Re-analysis:** Re-runs `cellranger-atac reanalyze` to evaluate bi-allelic peaks across both parental backgrounds.
+
+---
+
 ### Phase 1: Preprocessing & Coordination
 **Script:** `scripts/1_preprocessing.Rmd`
 
