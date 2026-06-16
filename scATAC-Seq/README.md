@@ -1,4 +1,4 @@
-# Allele-Specific Chromatin Accessibility Pipeline for Hybrid Mouse Systems
+# Allele-Specific Chromatin Accessibility Pipeline for Hybrid Mouse
 
 This repository contains a complete, reproducible single-cell ATAC-seq pipeline designed to analyze parent-of-origin variation in hybrid mouse models ($CAST \times B6$). The workflow uses a multi-phase design, starting with data preprocessing in R (**Signac/Seurat**), moving to latent cell-state classification in Python via an **Expectation-Maximization (EM) Algorithm**, and returning to R for downstream clustering, statistical testing, and genomic visualization.
 
