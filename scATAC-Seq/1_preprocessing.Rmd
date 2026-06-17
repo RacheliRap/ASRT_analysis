@@ -1,0 +1,260 @@
+---
+title: "Single-Cell ATAC-seq Allele-Specific Pipeline"
+subtitle: "From 10x Preprocessing to Post-EM Clustering"
+author: "Your Name / Lab"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+Environment & Dependencies
+First, we establish package requirements and baseline configurations.
+
+```{r}
+# Bioconductor Dependencies
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+required_bioc <- c("Signac", "GenomeInfoDb", "EnsDb.Mmusculus.v79")
+new_bioc <- required_bioc[!(required_bioc %in% installed.packages()[,"Package"])]
+if(length(new_bioc)) BiocManager::install(new_bioc)
+
+# CRAN Dependencies
+required_cran <- c("Seurat", "hdf5r", "dplyr", "ggplot2", "uwot", "tidyr", "tibble")
+new_cran <- required_cran[!(required_cran %in% installed.packages()[,"Package"])]
+if(length(new_cran)) install.packages(new_cran)
+
+# Load libraries
+library(Signac)
+library(Seurat)
+library(GenomeInfoDb)
+library(EnsDb.Mmusculus.v79)
+library(hdf5r)
+library(dplyr)
+library(GenomicRanges)
+library(ggplot2)
+library(uwot)
+library(tidyr)
+library(tibble)
+
+# Global configuration paths
+PATH_BIALLELIC <- "scATAC_preB_all/"
+PATH_GENOME1   <- "scATAC_preB_all_genome1_biPeaks/"
+PATH_GENOME2   <- "scATAC_preB_all_genome2_biPeaks/"
+PATH_BED_LIST  <- "async_master_list.GRCm38.noChr.bed"
+
+# Fetch gene annotations for GRCm38/mm10
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+#seqlevelsStyle(annotations) <- 'UCSC'
+```
+
+
+Custom Functions
+We wrap repeated code into functions to optimize clarity and reproducibility.
+
+```{r}
+# Function to parse and load raw 10x datasets
+import_atac <- function(count_path, meta_path, fragment_path) {
+  counts <- Read10X_h5(filename = count_path)
+  
+  # Structural control: remove cells expressing exclusive Y chromosome signatures
+  counts_Y <- counts[grep("Y", row.names(counts)), ]
+  counts.keep <- counts[, apply(counts_Y, 2, function(x) all(x == 0))]
+  
+  meta <- read.csv(file = meta_path, header = TRUE, row.names = 1)
+  
+  chrom_assay <- CreateChromatinAssay(
+    counts = counts,
+    sep = c(":", "-"),
+    genome = 'GRCm38',
+    fragments = fragment_path,
+    min.cells = 10,
+    min.features = 10
+  )
+  
+  data <- CreateSeuratObject(
+    counts = chrom_assay,
+    assay = "peaks",
+    meta.data = meta
+  )
+  
+  Annotation(data) <- annotations
+  data <- NormalizeData(data, normalization.method = "LogNormalize", scale.factor = 10000)
+  data <- NucleosomeSignal(object = data)
+  data <- TSSEnrichment(object = data, fast = FALSE)
+  
+  data$blacklist_ratio <- data$blacklist_region_fragments / data$peak_region_fragments
+  data$pct_reads_in_peaks <- data$peak_region_fragments / data$passed_filters * 100 
+  
+  return(data)
+}
+
+# Convert text-based regions back into GenomicRanges objects
+convert_peaks_to_granges <- function(peaks) {
+  peaks.df <- as.data.frame(do.call(rbind, lapply(peaks, function(x) unlist(strsplit(x, "[:-]")))))
+  colnames(peaks.df) <- c("seqnames", "start", "end")
+  makeGRangesFromDataFrame(peaks.df)
+}
+
+# Coordinate filtration across regional boundaries
+filter_seurat_by_overlap <- function(seurat_obj, target_gr) {
+  peaks <- row.names(seurat_obj[["peaks"]]@counts)
+  peaks_gr <- convert_peaks_to_granges(peaks)
+  overlap_indices <- IRanges::`%over%`(peaks_gr, target_gr)
+  return(subset(seurat_obj, features = peaks[overlap_indices]))
+}
+
+# Track pristine cross-allelic unique hits
+find_unique_overlaps <- function(gr1, gr2) {
+  overlaps <- findOverlaps(gr1, gr2)
+  overlaps <- overlaps[!duplicated(queryHits(overlaps)), ]
+  overlaps <- overlaps[!duplicated(subjectHits(overlaps)), ]
+  return(overlaps)
+}
+
+filter_seurat_by_hits <- function(seurat_obj, hits, type = "query") {
+  indices <- if(type == "query") queryHits(hits) else subjectHits(hits)
+  return(subset(seurat_obj, features = row.names(seurat_obj[["peaks"]]@counts)[indices]))
+}
+
+# Coordinate mapping and structural collapsing across the Master list
+compute_sums_for_overlaps <- function(seurat_obj, gr, asrt.gr) {
+  overlaps <- findOverlaps(gr, asrt.gr)
+  result <- rowsum(as.matrix(seurat_obj[["peaks"]]@counts[queryHits(overlaps), ]), 
+                   group = subjectHits(overlaps))
+  
+  sums_matrix <- as(result, "dgCMatrix")
+  subset_asrt <- asrt.gr[unique(subjectHits(overlaps)), ]
+  rownames(sums_matrix) <- paste0(seqnames(subset_asrt), "-", start(subset_asrt), "-", end(subset_asrt))
+  
+  chrom_assay <- CreateChromatinAssay(counts = sums_matrix, sep = c(":", "-"), genome = 'GRCm38')
+  return(CreateSeuratObject(counts = chrom_assay, assay = "peaks"))
+}
+
+# Conjoin matching cells by rows across parallel matrices
+merge_seurat_objects_by_rows <- function(seurat1, seurat2) {
+  counts1 <- seurat1[["peaks"]]@counts
+  counts2 <- seurat2[["peaks"]]@counts
+  row.names(counts2) <- paste0("chr", row.names(counts2))
+  
+  if (!identical(colnames(counts1), colnames(counts2))) {
+    stop("Cell barcodes do not match between genomic representations.")
+  }
+  
+  combined_counts <- rbind(counts1, counts2)
+  chrom_assay <- CreateChromatinAssay(counts = combined_counts, sep = c(":", "-"), genome = 'GRCm38')
+  return(CreateSeuratObject(counts = chrom_assay, assay = "peaks"))
+}
+```
+
+Phase 1: Preprocessing & Data Extraction
+Here we ingest our primary biallelic baseline profile and compute strict dynamic distribution bounds to purge lower-tier elements.
+
+```{r}
+# Load baseline profiling controls
+biallelic <- import_atac(
+  paste0(PATH_BIALLELIC, "filtered_peak_bc_matrix.h5"),
+  paste0(PATH_BIALLELIC, "singlecell.csv"),
+  paste0(PATH_BIALLELIC, "fragments.tsv.gz")
+)
+
+# Statistical quantile dynamic evaluation
+low_prf <- quantile(biallelic[["peak_region_fragments"]]$peak_region_fragments, probs = 0.02)
+hig_prf <- quantile(biallelic[["peak_region_fragments"]]$peak_region_fragments, probs = 0.98)
+low_prp <- quantile(biallelic[["pct_reads_in_peaks"]]$pct_reads_in_peaks, probs = 0.02)
+hig_ns  <- quantile(biallelic[["nucleosome_signal"]]$nucleosome_signal, probs = 0.98)
+low_ts  <- quantile(biallelic[["TSS.enrichment"]]$TSS.enrichment, probs = 0.02)
+
+# Purge outlying cell traces
+data_clean <- subset(
+  x = biallelic,
+  subset = peak_region_fragments > low_prf &
+    peak_region_fragments < hig_prf &
+    pct_reads_in_peaks > low_prp &
+    nucleosome_signal < hig_ns &
+    TSS.enrichment > low_ts
+)
+
+# Dereference background memory allocations
+biallelic <- NULL
+```
+
+
+Allele Integration
+Next, we map individual parental genomes (Genome1 and Genome2) across matching structural identities.
+
+```{r}
+allele1 <- import_atac(paste0(PATH_GENOME1, "filtered_peak_bc_matrix.h5"), 
+                       paste0(PATH_GENOME1, "singlecell.csv"), 
+                       paste0(PATH_GENOME1, "fragments.tsv.gz"))
+allele2 <- import_atac(paste0(PATH_GENOME2, "filtered_peak_bc_matrix.h5"),
+                       paste0(PATH_GENOME2, "singlecell.csv"), 
+                       paste0(PATH_GENOME2, "fragments.tsv.gz"))
+
+# Synchronize overlapping barcode matrices
+cells.to.keep <- intersect(row.names(data_clean@meta.data), row.names(allele1@meta.data))
+cells.to.keep <- intersect(cells.to.keep, row.names(allele2@meta.data))
+
+allele1 <- subset(allele1, cells = cells.to.keep)
+allele2 <- subset(allele2, cells = cells.to.keep)
+```
+
+
+Genomic Intersection Analysis
+Filter elements against structural replication targets defined by our target BED annotations.
+
+```{r}
+asrt <- read.delim(PATH_BED_LIST, header = FALSE) %>%
+  mutate(V1 = sub("^chr", "", V1)) %>%
+  dplyr::filter(V1 != "X") %>%
+  arrange(V1, V2, V3)
+colnames(asrt) <- c("seqnames", "start", "end", "early")
+asrt.gr <- makeGRangesFromDataFrame(asrt, keep.extra.columns = TRUE)
+
+# Apply intersections
+allele1 <- filter_seurat_by_overlap(allele1, asrt.gr)
+allele2 <- filter_seurat_by_overlap(allele2, asrt.gr)
+
+# Extract reciprocal unique representations
+overlaps <- find_unique_overlaps(granges(allele1), granges(allele2))
+allele1_asrt_overlap_allel2 <- filter_seurat_by_hits(allele1, overlaps, type = "query")
+allele2_asrt_overlap_allel1 <- filter_seurat_by_hits(allele2, overlaps, type = "subject")
+
+# Compute compressed master maps
+c1_sums <- compute_sums_for_overlaps(allele1_asrt_overlap_allel2, granges(allele1_asrt_overlap_allel2), asrt.gr)
+c2_sums <- compute_sums_for_overlaps(allele2_asrt_overlap_allel1, granges(allele2_asrt_overlap_allel1), asrt.gr)
+
+# Construct final exported dataset matrices
+combined <- merge_seurat_objects_by_rows(c1_sums, c2_sums)
+c_merged <- combined[["peaks"]]@data
+```
+
+Exporting Targets
+We write out structured inputs for classification and cache the workspace configuration state.
+
+```{r}
+
+tmp <- mergeByOverlaps(granges(c1_sums), asrt.gr)
+tmp <- tmp[!duplicated(tmp[,1]), ]
+early <- tmp$early
+
+regions_numeric1 <- as.numeric(early == "CAST")
+regions_numeric2 <- as.numeric(early != "CAST")
+regions_numeric_merged <- c(regions_numeric1, regions_numeric2)
+
+# Save deliverables to filesystem
+write.csv(t(as.matrix(c_merged)), "c_merged_bi_preB.csv")
+write.table(regions_numeric_merged, "regions_numeric_merged_bi_preB.csv", sep=",", row.names = FALSE, col.names = FALSE)
+
+save.image("scATAC_preB_all_bi.RData")
+
+```
+
