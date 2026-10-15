@@ -1,93 +1,100 @@
 #!/bin/bash
-
-#SBATCH -o logs/slurm.sample_node.%j.out
+#SBATCH -c 1
+#SBATCH --mem=2G
+#SBATCH -t 00:10:00
+#SBATCH -o logs/slurm.submit_sample.%j.out
 #SBATCH --mail-type=FAIL
 
-# Capture operational variables passed from Orchestrator script
-CLONE_DIR="$1"
-FIRST_MATE="$2"
+# ==============================================================================
+# 2_map_and_demultiplex.sh
+#
+# Per-sample allele-specific ATAC-seq processing (paired-end). Submitted by
+# 1_prepare_and_submit.sh; each step runs as a dependent SLURM job.
+#
+#   1. STAR mapping of R1 + R2 to the N-masked genome (no soft-clipping)
+#   2. MAPQ >= 20, properly paired reads, ENCODE blacklist removal
+#   3. duplicate removal (Picard MarkDuplicates)
+#   4. allele assignment (SNPsplit): genome1 = BALB/cJ, genome2 = CAST/EiJ
+#
+# Usage: 2_map_and_demultiplex.sh <FASTQ_DIR> <R1.trim.fastq.gz> <STAR_INDEX> <SNPSPLIT_SNP_TXT>
+# Output: <FASTQ_DIR>/mapped/<sample>.Aligned.sortedByCoord.out.mpq20.nodups.genome{1,2}.bam
+# ==============================================================================
+set -euo pipefail
+
+FASTQ_DIR="$1"
+FIRST_MATE="$2"                       # <sample>_R1_<...>.trim.fastq.gz
 STAR_INDEX="$3"
-VCF_FILE="$4"
+SNP_TXT="$4"                          # SNPsplit-format CAST SNPs where BALB = reference (from script 1)
+SECOND_MATE="${FIRST_MATE/_R1_/_R2_}"
 
-# Configuration Utilities
-export PROJECT_DIR="./async_repli_project"
-export SNPSPLIT_DIR="$PROJECT_DIR/tools/SNPsplit_v0.3.2"
-export BLACKLIST_BED="$PROJECT_DIR/data/mm10-blacklist.v2.bed"
-export PICARD_JAR="/sci/labs/itamarsi/britnyb/lab_files/bioinformatics/picard-tools-2.1.0/picard.jar"
+PROJECT=/path/to/async_repli_project
+SNPSPLIT=$PROJECT/tools/SNPsplit_v0.3.2
+BLACKLIST=$PROJECT/data/mm10-blacklist.v2.bed   # chromosome names must match the BAM (1 vs chr1)
+PICARD_JAR=/path/to/picard-tools-2.1.0/picard.jar
 
-STAR_POSTFIX="trim.Aligned.sortedByCoord.out"
+[ -s "$SNP_TXT" ] || { echo "[ERROR] SNP file not found: $SNP_TXT" >&2; exit 1; }
+[ -f "$SECOND_MATE" ] || { echo "[ERROR] Mate 2 not found: $SECOND_MATE" >&2; exit 1; }
 
-echo "[RUNNING] Processing data track file: $FIRST_MATE"
-SAMPLE_NAME=$(basename "$FIRST_MATE" _1.fastq.gz)
+SAMPLE=$(basename "$FIRST_MATE" .trim.fastq.gz | sed 's/_R1_/_/')
+MAPPED="$FASTQ_DIR/mapped"
+BASE="$MAPPED/$SAMPLE.Aligned.sortedByCoord.out"
+mkdir -p "$MAPPED" logs
+echo "[SAMPLE] $SAMPLE : $FIRST_MATE + $SECOND_MATE"
 
-# Make sure directory outputs structure exists cleanly
-mkdir -p "$CLONE_DIR/mapped"
+# ------------------------------------------------------------------------------
+# STEP 1: mapping
+# ------------------------------------------------------------------------------
+MAP_JOB=$(sbatch --parsable --mem=40G -c 8 -t 20:00:00 -o logs/slurm.STAR.$SAMPLE.%j.out \
+  --wrap="STAR --genomeDir $STAR_INDEX \
+      --runThreadN 8 \
+      --readFilesIn $FIRST_MATE $SECOND_MATE \
+      --readFilesCommand zcat \
+      --outFileNamePrefix $MAPPED/$SAMPLE. \
+      --outSAMtype BAM SortedByCoordinate \
+      --outSAMunmapped None \
+      --alignEndsType EndToEnd \
+      --outFilterScoreMinOverLread 0 \
+      --outFilterMatchNminOverLread 0 \
+      --outFilterMatchNmin 0 \
+      --outFilterMismatchNmax 2 \
+      --outSAMattributes NH HI NM MD nM AS")
+echo "[JOB] STAR: $MAP_JOB"
 
-# ==============================================================================
-# STEP 1: MAPPING VIA STAR
-# ==============================================================================
-echo "[STAGE 1] Launching core alignment script via STAR..."
+# ------------------------------------------------------------------------------
+# STEP 2: MAPQ >= 20 (uniquely mapped), properly paired, blacklist removed
+# ------------------------------------------------------------------------------
+MPQ_JOB=$(sbatch --parsable --dependency=afterok:$MAP_JOB --mem=10G -c 2 -t 04:00:00 \
+  -o logs/slurm.mpq.$SAMPLE.%j.out \
+  --wrap="samtools view -b -q 20 -f 2 $BASE.bam | samtools sort -@ 2 - | \
+          bedtools intersect -a - -b $BLACKLIST -v > $BASE.mpq20.bam")
+echo "[JOB] MAPQ/blacklist: $MPQ_JOB"
 
-MAPPING_JOB_ID=$(sbatch --wrap="STAR --genomeDir $STAR_INDEX \
-    --runThreadN 8 \
-    --readFilesIn $FIRST_MATE \
-    --outFileNamePrefix $CLONE_DIR/mapped/$SAMPLE_NAME. \
-    --outSAMtype BAM SortedByCoordinate \
-    --outSAMunmapped None \
-    --alignEndsType EndToEnd \
-    --readFilesCommand zcat \
-    --outFilterScoreMinOverLread 0 \
-    --outFilterMatchNminOverLread 0 \
-    --outFilterMatchNmin 0 \
-    --outFilterMismatchNmax 2 \
-    --outSAMattributes NH HI NM MD nM AS" \
-    --mem=40GB -c 8 -t 20:00:00 -N 1 -o logs/slurm.STAR.$SAMPLE_NAME.%j.out | cut -f 4 -d' ')
+# ------------------------------------------------------------------------------
+# STEP 3: duplicate removal
+# ------------------------------------------------------------------------------
+DUP_JOB=$(sbatch --parsable --dependency=afterok:$MPQ_JOB --mem=20G -c 1 -t 04:00:00 \
+  -o logs/slurm.rmDups.$SAMPLE.%j.out \
+  --wrap="java -Xmx4g -jar $PICARD_JAR MarkDuplicates \
+      INPUT=$BASE.mpq20.bam \
+      OUTPUT=$BASE.mpq20.nodups.bam \
+      METRICS_FILE=$BASE.dup_metrics.txt \
+      REMOVE_DUPLICATES=true")
+echo "[JOB] MarkDuplicates: $DUP_JOB"
 
-echo "[JOB ASSIGNED] STAR Mapping Job ID: $MAPPING_JOB_ID"
-
-# ==============================================================================
-# STEP 2: MAPQ FILTERING & BLACKLIST ELIMINATION
-# ==============================================================================
-echo "[STAGE 2] Queueing MAPQ20 alignment filtration and blacklist filtering..."
-
-MPQ_JOB_ID=$(sbatch --dependency=afterok:"$MAPPING_JOB_ID" --wrap="samtools view -bq 20 $CLONE_DIR/mapped/$SAMPLE_NAME.$STAR_POSTFIX.bam | \
-    samtools sort -@ 2 - |\
-    bedtools intersect -a - -b $BLACKLIST_BED -v \
-    > $CLONE_DIR/mapped/$SAMPLE_NAME.$STAR_POSTFIX.mpq20.bam" \
-    --mem=10GB -c 2 -t 04:00:00 -o logs/slurm.mpq.$SAMPLE_NAME.%j.out | cut -f 4 -d' ')
-
-echo "[JOB ASSIGNED] MAPQ Filter Job ID: $MPQ_JOB_ID"
-
-# ==============================================================================
-# STEP 3: DUPLICATE REMOVAL VIA PICARD
-# ==============================================================================
-echo "[STAGE 3] Running duplicate fragment elimination via Picard MarkDuplicates..."
-
-DUPS_JOB_ID=$(sbatch --dependency=afterok:"$MPQ_JOB_ID" --wrap="java -Xmx4g -jar $PICARD_JAR MarkDuplicates \
-    INPUT=$CLONE_DIR/mapped/$SAMPLE_NAME.$STAR_POSTFIX.mpq20.bam \
-    OUTPUT=$CLONE_DIR/mapped/$SAMPLE_NAME.$STAR_POSTFIX.mpq20.nodups.bam \
-    METRICS_FILE=$CLONE_DIR/mapped/$SAMPLE_NAME.$STAR_POSTFIX.metrics.txt \
-    REMOVE_DUPLICATES=true" \
-    --mem=20GB -c 1 -t 04:00:00 -o logs/slurm.rmDups.$SAMPLE_NAME.%j.out | cut -f 4 -d' ')
-
-echo "[JOB ASSIGNED] MarkDuplicates Job ID: $DUPS_JOB_ID"
-
-# ==============================================================================
-# STEP 4: ALLELE-SPECIFIC SORTING VIA SNPSPLIT
-# ==============================================================================
-echo "[STAGE 4] Converting variant configurations and parsing SNPSplit arrays..."
-
-# Format inputs to match SNPsplit naming standards
-awk '{OFS="\t"}; {print NR, $1, $2, 1, $4"/"$5}' "$VCF_FILE" > "$VCF_FILE.phased.txt"
-
-SNPSPLIT_JOB_ID=$(sbatch --dependency=afterok:"$DUPS_JOB_ID" --wrap="$SNPSPLIT_DIR/SNPsplit \
-    --snp_file $VCF_FILE.phased.txt \
-    $CLONE_DIR/mapped/$SAMPLE_NAME*mpq20.nodups.bam \
-    --conflicting \
-    --weird \
-    --paired \
-    --no_sort" \
-    --mem=25GB -c 2 -t 04:00:00 -o logs/slurm.snpSplit.$SAMPLE_NAME.%j.out | cut -f 4 -d' ')
-
-echo "[JOB ASSIGNED] SNPsplit Processing Job ID: $SNPSPLIT_JOB_ID"
-echo "[SUCCESS] All processing jobs for sample $SAMPLE_NAME successfully submitted."
+# ------------------------------------------------------------------------------
+# STEP 4: allele assignment
+# SNPsplit SNP format: ID  chr  pos  strand  ref/alt
+#   ref = C57BL/6 = BALB/cJ base  -> genome1 (BALB/cJ)
+#   alt = CAST/EiJ base           -> genome2 (CAST/EiJ)
+# --paired requires name-sorted input; SNPsplit sorts the coordinate-sorted
+# BAM itself (hence no --no_sort).
+# ------------------------------------------------------------------------------
+SPLIT_JOB=$(sbatch --parsable --dependency=afterok:$DUP_JOB --mem=25G -c 2 -t 04:00:00 \
+  -o logs/slurm.snpSplit.$SAMPLE.%j.out \
+  --wrap="cd $MAPPED && $SNPSPLIT/SNPsplit \
+      --snp_file $SNP_TXT \
+      --paired \
+      --conflicting \
+      --weird \
+      $BASE.mpq20.nodups.bam")
+echo "[JOB] SNPsplit: $SPLIT_JOB"
